@@ -1,0 +1,16 @@
+-- Enable RLS on Prisma's own bookkeeping table.
+--
+-- 20261020000001 covered the eleven application tables, but not this one:
+-- Prisma creates `_prisma_migrations` itself, outside the migration files, so
+-- it was left with RLS off and inherited Supabase's default grants to `anon`.
+--
+-- That was not merely an information leak (the migration history was readable
+-- with the browser-public key). It was WRITABLE: a POST to
+-- /rest/v1/_prisma_migrations returned 201. A forged row here makes Prisma
+-- believe a migration has already run — or, deleted, makes it re-run one —
+-- so an anonymous caller could wedge every future `migrate deploy`.
+--
+-- No policies, same as the other tables: that denies `anon` and
+-- `authenticated` everything, while Prisma connects as `postgres`
+-- (BYPASSRLS) and is unaffected.
+alter table "_prisma_migrations" enable row level security;
