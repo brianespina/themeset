@@ -1,0 +1,202 @@
+// ThemeSet.online — database schema
+// Ported from the developer handoff's "Database Structure" section (23).
+// Marketplace pricing is sourced from SteamAnalyst (see src/lib/steamanalyst
+// and src/lib/pricing/refresh.ts) — the `prices` table stays multi-marketplace
+// shaped so other sources can be added later without a migration.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // Runtime queries. On serverless (Vercel) this is Supabase's TRANSACTION
+  // pooler (port 6543, `?pgbouncer=true`), because each function instance
+  // opens its own connection and session mode would exhaust the pool.
+  url       = env("DATABASE_URL")
+  // Migrations and introspection. pgBouncer's transaction mode cannot run
+  // them, so these go to the SESSION pooler (port 5432) instead. Locally both
+  // can point at the same session-pooler URL.
+  directUrl = env("DIRECT_URL")
+}
+
+// Profile row for a Supabase Auth user. `id` is NOT generated here: it is the
+// UUID from Supabase's `auth.users` table, written by syncUser() on first
+// sign-in (see src/lib/auth/user.ts). Supabase owns identity; this row owns
+// the ThemeSet-side profile and is what loadouts/likes/comments key on.
+model User {
+  id        String   @id @db.Uuid
+  username  String   @unique
+  email     String?  @unique
+  avatarUrl String?  @map("avatar_url")
+  steamId   String?  @unique @map("steam_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  loadouts  Loadout[]
+  likes     Like[]
+  favorites Favorite[]
+  comments  Comment[]
+
+  @@map("users")
+}
+
+// Canonical skin identity (one row per weapon+paint), independent of exterior/wear.
+model Skin {
+  id              String   @id @default(cuid())
+  weapon          String
+  name            String
+  marketHashName  String   @unique @map("market_hash_name")
+  imageUrl        String?  @map("image_url")
+  rarity          String?
+  collection      String?
+  description     String?
+
+  variants   SkinVariant[]
+  attributes SkinAttributes?
+
+  @@index([weapon])
+  @@map("skins")
+}
+
+// One row per sellable variant: exterior x StatTrak x Souvenir x doppler phase.
+model SkinVariant {
+  id       String  @id @default(cuid())
+  skinId   String  @map("skin_id")
+  skin     Skin    @relation(fields: [skinId], references: [id], onDelete: Cascade)
+  exterior String?
+  floatMin Float?  @map("float_min")
+  floatMax Float?  @map("float_max")
+  stattrak Boolean @default(false)
+  souvenir Boolean @default(false)
+  phase    String?
+  pattern  String?
+
+  prices       Price[]
+  priceHistory PriceHistory[]
+  loadoutItems LoadoutItem[]
+
+  @@unique([skinId, exterior, stattrak, souvenir, phase])
+  @@map("skin_variants")
+}
+
+// Matching-engine attributes. `colorScore` etc. are derived, not user-editable.
+model SkinAttributes {
+  skinId         String   @id @map("skin_id")
+  skin           Skin     @relation(fields: [skinId], references: [id], onDelete: Cascade)
+  primaryColor   String?  @map("primary_color")
+  secondaryColor String?  @map("secondary_color")
+  accentColors   String[] @map("accent_colors")
+  colorScore     Float?   @map("color_score")
+  style          String[]
+  theme          String[]
+  brightness     Float?
+  contrast       Float?
+  visualTags     String[] @map("visual_tags")
+
+  @@map("skin_attributes")
+}
+
+// Current price snapshot per marketplace. SteamAnalyst is the seeded source;
+// `marketplace` stays a plain string so CSFloat/DMarket/etc. can be added
+// without a schema change.
+model Price {
+  id            String      @id @default(cuid())
+  skinVariantId String      @map("skin_variant_id")
+  skinVariant   SkinVariant @relation(fields: [skinVariantId], references: [id], onDelete: Cascade)
+  marketplace   String      @default("steamanalyst")
+  price         Float
+  currency      String      @default("USD")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+
+  @@unique([skinVariantId, marketplace])
+  @@map("prices")
+}
+
+model PriceHistory {
+  id            String      @id @default(cuid())
+  skinVariantId String      @map("skin_variant_id")
+  skinVariant   SkinVariant @relation(fields: [skinVariantId], references: [id], onDelete: Cascade)
+  marketplace   String      @default("steamanalyst")
+  price         Float
+  timestamp     DateTime    @default(now())
+
+  @@index([skinVariantId, timestamp])
+  @@map("price_history")
+}
+
+model Loadout {
+  id          String   @id @default(cuid())
+  userId      String   @map("user_id") @db.Uuid
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  budget      Float?
+  matchScore  Int?     @map("match_score")
+  theme       String
+  isPublic    Boolean  @default(false) @map("is_public")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  items     LoadoutItem[]
+  likes     Like[]
+  favorites Favorite[]
+  comments  Comment[]
+
+  @@map("loadouts")
+}
+
+// A single slot of a saved loadout.
+//
+// `skinRef` is the seed-catalog skin id (e.g. "m9-crimson") from
+// src/lib/seed-data.ts, and is the source of truth for rendering: every screen
+// in the app addresses skins by that id. `skinVariantId` stays as an OPTIONAL
+// link to a priced SkinVariant row, because those rows only exist for skins the
+// daily SteamAnalyst refresh has actually seen. Keying items on skinVariantId
+// alone would mean a user could only save skins the cron had already priced.
+model LoadoutItem {
+  id            String       @id @default(cuid())
+  loadoutId     String       @map("loadout_id")
+  loadout       Loadout      @relation(fields: [loadoutId], references: [id], onDelete: Cascade)
+  skinRef       String       @map("skin_ref")
+  skinVariantId String?      @map("skin_variant_id")
+  skinVariant   SkinVariant? @relation(fields: [skinVariantId], references: [id], onDelete: SetNull)
+  weaponSlot    String       @map("weapon_slot")
+  position      Int          @default(0)
+
+  @@unique([loadoutId, weaponSlot])
+  @@map("loadout_items")
+}
+
+model Like {
+  userId    String   @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  loadoutId String   @map("loadout_id")
+  loadout   Loadout  @relation(fields: [loadoutId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([userId, loadoutId])
+  @@map("likes")
+}
+
+model Favorite {
+  userId    String   @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  loadoutId String   @map("loadout_id")
+  loadout   Loadout  @relation(fields: [loadoutId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@id([userId, loadoutId])
+  @@map("favorites")
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id") @db.Uuid
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  loadoutId String   @map("loadout_id")
+  loadout   Loadout  @relation(fields: [loadoutId], references: [id], onDelete: Cascade)
+  comment   String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("comments")
+}
